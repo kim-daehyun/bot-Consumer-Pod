@@ -31,12 +31,17 @@ def _extract_path(raw: Dict[str, Any]) -> Optional[str]:
     return None
 
 
-def _extract_session_id(raw: Dict[str, Any]) -> Optional[str]:
+def _extract_request_body(raw: Dict[str, Any]) -> Dict[str, Any]:
+    body = raw.get("requestBody")
+    return body if isinstance(body, dict) else {}
+
+
+def _extract_session_key(raw: Dict[str, Any]) -> Optional[str]:
     return (
-        _safe_str(raw.get("session_id"))
-        or _safe_str(raw.get("UUID"))
+        _safe_str(raw.get("UUID"))
         or _safe_str(raw.get("uuid"))
         or _safe_str(raw.get("sessionId"))
+        or _safe_str(raw.get("session_id"))
     )
 
 
@@ -77,21 +82,16 @@ def _extract_x_user_id(raw: Dict[str, Any]) -> Optional[str]:
 
 
 def _extract_order_id(raw: Dict[str, Any]) -> Optional[str]:
-    order_id = _safe_str(raw.get("orderId"))
+    body = _extract_request_body(raw)
+    query = raw.get("queryParams") if isinstance(raw.get("queryParams"), dict) else {}
+
+    order_id = (
+        _safe_str(raw.get("orderId"))
+        or _safe_str(body.get("orderId"))
+        or _safe_str(query.get("orderId"))
+    )
     if order_id:
         return order_id
-
-    request_body = raw.get("requestBody")
-    if isinstance(request_body, dict):
-        order_id = _safe_str(request_body.get("orderId"))
-        if order_id:
-            return order_id
-
-    query_params = raw.get("queryParams")
-    if isinstance(query_params, dict):
-        order_id = _safe_str(query_params.get("orderId"))
-        if order_id:
-            return order_id
 
     path = _extract_path(raw)
     if not path:
@@ -107,15 +107,14 @@ def _extract_order_id(raw: Dict[str, Any]) -> Optional[str]:
 
 
 def _extract_reservation_number(raw: Dict[str, Any]) -> Optional[str]:
-    reservation_number = _safe_str(raw.get("reservationNumber"))
+    body = _extract_request_body(raw)
+
+    reservation_number = (
+        _safe_str(raw.get("reservationNumber"))
+        or _safe_str(body.get("reservationNumber"))
+    )
     if reservation_number:
         return reservation_number
-
-    request_body = raw.get("requestBody")
-    if isinstance(request_body, dict):
-        reservation_number = _safe_str(request_body.get("reservationNumber"))
-        if reservation_number:
-            return reservation_number
 
     path = _extract_path(raw)
     if not path:
@@ -131,7 +130,7 @@ def _extract_reservation_number(raw: Dict[str, Any]) -> Optional[str]:
 @dataclass
 class BEState:
     join_key: str
-    session_id: Optional[str] = None
+    session_key: Optional[str] = None
     x_user_id: Optional[str] = None
     order_id: Optional[str] = None
     reservation_number: Optional[str] = None
@@ -143,16 +142,6 @@ class BEState:
 
 
 class StateStore:
-    """
-    FE:
-      - Redis에 session/window 상태 저장
-      - Redis에 blocked_ticket 저장
-
-    BE:
-      - request/event join은 인메모리 state
-      - 결과 누적/리스크 카운트는 Redis 저장
-    """
-
     def __init__(
         self,
         redis_client: redis.Redis,
@@ -178,16 +167,16 @@ class StateStore:
         self._be_states: Dict[str, BEState] = {}
 
     # ------------------------------------------------------------------
-    # FE state in Redis
+    # FE redis state
     # ------------------------------------------------------------------
-    def _fe_state_key(self, session_id: str) -> str:
-        return f"{self.fe_state_prefix}:{session_id}"
+    def _fe_state_key(self, session_key: str) -> str:
+        return f"{self.fe_state_prefix}:{session_key}"
 
-    def load_fe_state(self, session_id: str) -> Dict[str, Any]:
-        raw_value = self.redis_client.get(self._fe_state_key(session_id))
+    def load_fe_state(self, session_key: str) -> Dict[str, Any]:
+        raw_value = self.redis_client.get(self._fe_state_key(session_key))
         if raw_value is None:
             return {
-                "session_id": session_id,
+                "session_key": session_key,
                 "X-Session-Ticket": None,
                 "showScheduleId": None,
                 "page_stage": None,
@@ -203,18 +192,18 @@ class StateStore:
             raw_value = raw_value.decode("utf-8")
         return json.loads(raw_value)
 
-    def save_fe_state(self, session_id: str, state: Dict[str, Any]) -> None:
+    def save_fe_state(self, session_key: str, state: Dict[str, Any]) -> None:
         self.redis_client.setex(
-            self._fe_state_key(session_id),
+            self._fe_state_key(session_key),
             self.fe_state_ttl_sec,
             json.dumps(state, ensure_ascii=False),
         )
 
-    def delete_fe_state(self, session_id: str) -> None:
-        self.redis_client.delete(self._fe_state_key(session_id))
+    def delete_fe_state(self, session_key: str) -> None:
+        self.redis_client.delete(self._fe_state_key(session_key))
 
     # ------------------------------------------------------------------
-    # FE blocked_ticket in Redis
+    # FE blocked ticket
     # ------------------------------------------------------------------
     def _blocked_ticket_key(self, x_session_ticket: str) -> str:
         return f"{self.blocked_ticket_prefix}:{x_session_ticket}"
@@ -227,7 +216,7 @@ class StateStore:
         return bool(self.redis_client.exists(self._blocked_ticket_key(x_session_ticket)))
 
     # ------------------------------------------------------------------
-    # BE risk data in Redis
+    # BE risk info
     # ------------------------------------------------------------------
     def _be_risk_user_key(self, x_user_id: str) -> str:
         return f"{self.be_risk_user_prefix}:{x_user_id}"
@@ -238,14 +227,6 @@ class StateStore:
     def incr_be_bot_count(self, x_user_id: str) -> int:
         return int(self.redis_client.incr(self._be_risk_user_key(x_user_id)))
 
-    def get_be_bot_count(self, x_user_id: str) -> int:
-        value = self.redis_client.get(self._be_risk_user_key(x_user_id))
-        if value is None:
-            return 0
-        if isinstance(value, bytes):
-            value = value.decode("utf-8")
-        return int(value)
-
     def set_risk_order(self, order_id: str, payload: Dict[str, Any]) -> None:
         self.redis_client.setex(
             self._be_risk_order_key(order_id),
@@ -254,21 +235,21 @@ class StateStore:
         )
 
     # ------------------------------------------------------------------
-    # BE join state in memory
+    # BE join state
     # ------------------------------------------------------------------
     def _make_be_join_key(self, raw: Dict[str, Any]) -> str:
-        session_id = _extract_session_id(raw)
         order_id = _extract_order_id(raw)
         reservation_number = _extract_reservation_number(raw)
+        session_key = _extract_session_key(raw)
 
         if order_id:
             return f"order:{order_id}"
         if reservation_number:
             return f"reservation:{reservation_number}"
-        if session_id:
-            return f"session:{session_id}"
+        if session_key:
+            return f"session:{session_key}"
 
-        raise ValueError("BE raw must include at least one of session_id / reservationNumber / orderId")
+        raise ValueError("BE raw must include one of orderId / reservationNumber / session key")
 
     def get_or_create_be_state(self, raw: Dict[str, Any]) -> BEState:
         join_key = self._make_be_join_key(raw)
@@ -278,13 +259,13 @@ class StateStore:
             state = BEState(join_key=join_key)
             self._be_states[join_key] = state
 
-        session_id = _extract_session_id(raw)
+        session_key = _extract_session_key(raw)
         x_user_id = _extract_x_user_id(raw)
         order_id = _extract_order_id(raw)
         reservation_number = _extract_reservation_number(raw)
 
-        if session_id:
-            state.session_id = session_id
+        if session_key:
+            state.session_key = session_key
         if x_user_id:
             state.x_user_id = x_user_id
         if order_id:
@@ -298,11 +279,11 @@ class StateStore:
         self._be_states.pop(join_key, None)
 
     # ------------------------------------------------------------------
-    # raw helper exposure
+    # helper exposure
     # ------------------------------------------------------------------
     @staticmethod
-    def extract_session_id(raw: Dict[str, Any]) -> Optional[str]:
-        return _extract_session_id(raw)
+    def extract_session_key(raw: Dict[str, Any]) -> Optional[str]:
+        return _extract_session_key(raw)
 
     @staticmethod
     def extract_x_session_ticket(raw: Dict[str, Any]) -> Optional[str]:
@@ -323,3 +304,11 @@ class StateStore:
     @staticmethod
     def extract_reservation_number(raw: Dict[str, Any]) -> Optional[str]:
         return _extract_reservation_number(raw)
+
+    @staticmethod
+    def extract_path(raw: Dict[str, Any]) -> Optional[str]:
+        return _extract_path(raw)
+
+    @staticmethod
+    def extract_request_body(raw: Dict[str, Any]) -> Dict[str, Any]:
+        return _extract_request_body(raw)

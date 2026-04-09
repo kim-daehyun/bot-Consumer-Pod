@@ -33,26 +33,25 @@ def _safe_str(value: Any) -> Optional[str]:
 
 class FEProcessor:
     """
-    bot-detection/scripts/preprocess_fe.py 기준으로
-    FE feature 3개를 동일하게 만든다.
-
-    feature:
-      - duration_ms
-      - mouse_teleport_rate
-      - mousemove_count
+    최신 FE 기준:
+    - duration_ms
+    - mousemove_teleport_count
+    - mousemove_count
 
     식별자:
-      - session_id
-      - X-Session-Ticket
-      - showScheduleId
+    - X-Session-Ticket
+    - showScheduleId
+
+    Redis에 session/window 상태를 누적하고,
+    seatmap 종료 시 feature payload를 만든다.
     """
 
     def __init__(
         self,
         state_store: StateStore,
         teleport_dt_ms_threshold: int = 20,
-        teleport_norm_dist_threshold: float = 0.12,
-        teleport_norm_speed_threshold: float = 0.006,
+        teleport_norm_dist_threshold: float = 0.003,
+        teleport_norm_speed_threshold: float = 0.002,
     ) -> None:
         self.state_store = state_store
         self.teleport_dt_ms_threshold = teleport_dt_ms_threshold
@@ -60,32 +59,27 @@ class FEProcessor:
         self.teleport_norm_speed_threshold = teleport_norm_speed_threshold
 
     def process(self, raw: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        session_id = self.state_store.extract_session_id(raw)
-        if not session_id:
-            raise ValueError("FE raw must include session_id/UUID/sessionId")
+        session_key = self.state_store.extract_session_key(raw)
+        if not session_key:
+            raise ValueError("FE raw must include UUID/sessionId/session_id")
 
-        state = self.state_store.load_fe_state(session_id)
+        body = self.state_store.extract_request_body(raw)
+        state = self.state_store.load_fe_state(session_key)
 
-        self._update_common_state(state, raw)
-        self._merge_mousemove(state, raw)
-        self._merge_mousemove_count(state, raw)
+        self._update_common_state(state, raw, body)
+        self._merge_mousemove(state, body)
+        self._merge_mousemove_count(state, body)
 
-        self.state_store.save_fe_state(session_id, state)
+        self.state_store.save_fe_state(session_key, state)
 
-        if not self._is_finalize(raw, state):
+        if not self._is_finalize(body):
             return None
 
-        payload = self._build_feature_payload(session_id, state)
-        self.state_store.delete_fe_state(session_id)
+        payload = self._build_feature_payload(state)
+        self.state_store.delete_fe_state(session_key)
         return payload
 
-    def _extract_request_body(self, raw: Dict[str, Any]) -> Dict[str, Any]:
-        request_body = raw.get("requestBody")
-        return request_body if isinstance(request_body, dict) else raw
-
-    def _update_common_state(self, state: Dict[str, Any], raw: Dict[str, Any]) -> None:
-        body = self._extract_request_body(raw)
-
+    def _update_common_state(self, state: Dict[str, Any], raw: Dict[str, Any], body: Dict[str, Any]) -> None:
         x_session_ticket = self.state_store.extract_x_session_ticket(raw)
         show_schedule_id = self.state_store.extract_show_schedule_id(raw)
 
@@ -119,14 +113,7 @@ class FEProcessor:
         if viewport_height is not None:
             state["viewport_height"] = viewport_height
 
-    def _merge_mousemove_count(self, state: Dict[str, Any], raw: Dict[str, Any]) -> None:
-        body = self._extract_request_body(raw)
-        mousemove_count = _safe_int(body.get("mousemove_count"))
-        if mousemove_count is not None and mousemove_count >= 0:
-            state["mousemove_count"] = max(state.get("mousemove_count", 0), mousemove_count)
-
-    def _merge_mousemove(self, state: Dict[str, Any], raw: Dict[str, Any]) -> None:
-        body = self._extract_request_body(raw)
+    def _merge_mousemove(self, state: Dict[str, Any], body: Dict[str, Any]) -> None:
         events = body.get("mousemove")
         if not isinstance(events, list) or not events:
             return
@@ -136,14 +123,11 @@ class FEProcessor:
         for event in events:
             if not isinstance(event, dict):
                 continue
-
             ts = _safe_int(event.get("timestamp"))
             x = _safe_int(event.get("x"))
             y = _safe_int(event.get("y"))
-
             if ts is None or x is None or y is None:
                 continue
-
             merged.append({"timestamp": ts, "x": x, "y": y})
 
         merged.sort(key=lambda item: item["timestamp"])
@@ -158,28 +142,30 @@ class FEProcessor:
             deduped.append(item)
 
         state["mousemove"] = deduped
+
+    def _merge_mousemove_count(self, state: Dict[str, Any], body: Dict[str, Any]) -> None:
+        mousemove_count = _safe_int(body.get("mousemove_count"))
+        if mousemove_count is not None and mousemove_count >= 0:
+            state["mousemove_count"] = max(state.get("mousemove_count", 0), mousemove_count)
+
         if state.get("mousemove_count", 0) <= 0:
-            state["mousemove_count"] = len(deduped)
+            state["mousemove_count"] = len(state.get("mousemove", []))
 
-    def _is_finalize(self, raw: Dict[str, Any], state: Dict[str, Any]) -> bool:
-        body = self._extract_request_body(raw)
+    def _is_finalize(self, body: Dict[str, Any]) -> bool:
+        return _safe_int(body.get("page_leave_ts")) is not None
 
-        if _safe_int(body.get("page_leave_ts")) is not None:
-            return True
+    def _build_feature_payload(self, state: Dict[str, Any]) -> Dict[str, Any]:
+        page_enter_ts = _safe_int(state.get("page_enter_ts"))
+        page_leave_ts = _safe_int(state.get("page_leave_ts"))
+        if page_enter_ts is None or page_leave_ts is None:
+            raise ValueError("FE finalize requires page_enter_ts and page_leave_ts")
 
-        is_stage_end = raw.get("is_stage_end")
-        if isinstance(is_stage_end, bool) and is_stage_end:
-            return True
+        duration_ms = page_leave_ts - page_enter_ts
+        if duration_ms <= 0:
+            raise ValueError("Invalid FE duration_ms")
 
-        return False
-
-    def _build_feature_payload(self, session_id: str, state: Dict[str, Any]) -> Dict[str, Any]:
-        duration_ms = self._calc_duration_ms(
-            page_enter_ts=_safe_int(state.get("page_enter_ts")),
-            page_leave_ts=_safe_int(state.get("page_leave_ts")),
-        )
         mousemove_count = _safe_int(state.get("mousemove_count")) or 0
-        mouse_teleport_rate = self._calc_mouse_teleport_rate(state)
+        mousemove_teleport_count = self._calc_mousemove_teleport_count(state)
 
         x_session_ticket = _safe_str(state.get("X-Session-Ticket"))
         show_schedule_id = _safe_int(state.get("showScheduleId"))
@@ -190,33 +176,22 @@ class FEProcessor:
             raise ValueError("FE finalize requires showScheduleId")
 
         return {
-            "session_id": session_id,
             "X-Session-Ticket": x_session_ticket,
             "showScheduleId": show_schedule_id,
             "duration_ms": float(duration_ms),
-            "mouse_teleport_rate": float(round(mouse_teleport_rate, 6)),
+            "mousemove_teleport_count": float(mousemove_teleport_count),
             "mousemove_count": float(mousemove_count),
         }
 
-    def _calc_duration_ms(self, page_enter_ts: Optional[int], page_leave_ts: Optional[int]) -> int:
-        if page_enter_ts is None or page_leave_ts is None:
-            raise ValueError("FE finalize requires page_enter_ts and page_leave_ts")
-        duration_ms = page_leave_ts - page_enter_ts
-        return max(0, int(duration_ms))
-
-    def _calc_mouse_teleport_rate(self, state: Dict[str, Any]) -> float:
+    def _calc_mousemove_teleport_count(self, state: Dict[str, Any]) -> int:
         events = state.get("mousemove", [])
         if not isinstance(events, list) or len(events) < 2:
-            return 0.0
+            return 0
 
-        mousemove_count = _safe_int(state.get("mousemove_count")) or 0
         viewport_width = _safe_float(state.get("viewport_width"))
         viewport_height = _safe_float(state.get("viewport_height"))
-
-        if mousemove_count <= 0 or viewport_width is None or viewport_height is None:
-            return 0.0
-        if viewport_width <= 0 or viewport_height <= 0:
-            return 0.0
+        if viewport_width is None or viewport_height is None or viewport_width <= 0 or viewport_height <= 0:
+            return 0
 
         teleport_count = 0
 
@@ -241,17 +216,16 @@ class FEProcessor:
             dx = curr_x - prev_x
             dy = curr_y - prev_y
 
-            norm_dx = dx / viewport_width if viewport_width > 0 else 0.0
-            norm_dy = dy / viewport_height if viewport_height > 0 else 0.0
+            norm_dx = dx / viewport_width
+            norm_dy = dy / viewport_height
             norm_dist = math.sqrt(norm_dx ** 2 + norm_dy ** 2)
             norm_speed = norm_dist / dt
 
-            is_teleport = (
-                (dt < self.teleport_dt_ms_threshold and norm_dist > self.teleport_norm_dist_threshold)
-                or (norm_speed > self.teleport_norm_speed_threshold)
-            )
-
-            if is_teleport:
+            if (
+                dt < self.teleport_dt_ms_threshold and norm_dist > self.teleport_norm_dist_threshold
+            ) or (
+                norm_speed > self.teleport_norm_speed_threshold
+            ):
                 teleport_count += 1
 
-        return teleport_count / max(mousemove_count, 1)
+        return teleport_count

@@ -25,19 +25,15 @@ def _safe_str(value: Any) -> Optional[str]:
 
 class BEProcessor:
     """
-    bot-detection/scripts/preprocess_be.py 기준으로
-    BE feature 4개를 만든다.
-
-    feature:
-      - ts_payment_ready
-      - ts_whole_session
-      - req_interval_cv_pre_hold
-      - req_interval_cv_hold_gap
+    최신 BE 기준:
+    - ts_payment_ready
+    - ts_whole_session
+    - req_interval_cv_pre_hold
+    - req_interval_cv_hold_gap
 
     식별자:
-      - session_id
-      - X-User-Id
-      - orderId
+    - X-User-Id
+    - orderId
     """
 
     HOLD_SEAT_PATTERN = re.compile(r"^/api/ticketing/[^/]+/hold/seat$")
@@ -60,7 +56,7 @@ class BEProcessor:
 
     def _update_request_state(self, state: BEState, raw: Dict[str, Any]) -> None:
         ts = _safe_int(raw.get("tsServer"))
-        path = _safe_str(raw.get("path"))
+        path = self.state_store.extract_path(raw)
         if ts is None or not path:
             return
 
@@ -68,35 +64,39 @@ class BEProcessor:
             {
                 "tsServer": ts,
                 "path": path,
-                "requestBody": raw.get("requestBody", {}),
-                "queryParams": raw.get("queryParams", {}),
+                "requestBody": self.state_store.extract_request_body(raw),
+                "queryParams": raw.get("queryParams", {}) if isinstance(raw.get("queryParams"), dict) else {},
             }
         )
 
         if path.endswith("/payment-ready") and state.ts_payment_ready_start is None:
             state.ts_payment_ready_start = ts
 
+        if path == self.PAY_FAIL_PATH and state.ts_terminal is None:
+            state.ts_terminal = ts
+
     def _update_event_state(self, state: BEState, raw: Dict[str, Any]) -> None:
         ts = (
             _safe_int(raw.get("tsServer"))
             or _safe_int(raw.get("timestamp"))
+            or _safe_int(raw.get("approvedAt"))
             or _safe_int(raw.get("ts_approvedAt"))
             or _safe_int(raw.get("ts_approvedAt_or_ts_fail"))
         )
         if ts is None:
             return
 
-        path = _safe_str(raw.get("path"))
+        path = self.state_store.extract_path(raw)
         event_name = _safe_str(raw.get("event_name"))
+
+        if path and path.endswith("/payment-ready") and state.ts_payment_ready_start is None:
+            state.ts_payment_ready_start = ts
+
         approved_at = (
             _safe_int(raw.get("approvedAt"))
             or _safe_int(raw.get("ts_approvedAt"))
             or _safe_int(raw.get("ts_approvedAt_or_ts_fail"))
         )
-
-        if path and path.endswith("/payment-ready") and state.ts_payment_ready_start is None:
-            state.ts_payment_ready_start = ts
-
         if approved_at is not None:
             state.ts_terminal = approved_at
             return
@@ -117,15 +117,12 @@ class BEProcessor:
         req_interval_cv_pre_hold = self._calc_req_interval_cv_pre_hold(state)
         req_interval_cv_hold_gap = self._calc_req_interval_cv_hold_gap(state)
 
-        if ts_payment_ready is None:
+        if ts_payment_ready is None or ts_whole_session is None:
             return None
-        if ts_whole_session is None:
-            return None
-        if not state.session_id or not state.x_user_id or not state.order_id:
+        if not state.x_user_id or not state.order_id:
             return None
 
         payload = {
-            "session_id": state.session_id,
             "X-User-Id": state.x_user_id,
             "orderId": state.order_id,
             "ts_payment_ready": float(ts_payment_ready),
@@ -156,7 +153,6 @@ class BEProcessor:
 
             if login_ts is None and path == self.LOGIN_PATH:
                 login_ts = ts
-
             if path == self.PAY_CONFIRM_PATH:
                 confirm_ts = ts
 
